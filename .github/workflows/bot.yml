@@ -1,0 +1,60 @@
+name: bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # кожні 10 хвилин (GitHub може запізнюватись)
+  workflow_dispatch:         # ручний запуск кнопкою «Run workflow»
+
+concurrency:
+  group: bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write            # щоб зберігати зашифрований стан у репозиторії
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Встановити залежності
+        run: pip install feedparser
+
+      - name: Розшифрувати стан
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          if [ -f state.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -in state.enc -out state.json -pass env:STATE_KEY
+            cp state.json state.before
+          fi
+
+      - name: Запустити бота
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          CHANNEL_ID: ${{ vars.CHANNEL_ID }}
+          NEWS_FEEDS: ${{ vars.NEWS_FEEDS }}
+          NEWS_FEEDS_FILTERED: ${{ vars.NEWS_FEEDS_FILTERED }}
+          NEWS_KEYWORDS: ${{ vars.NEWS_KEYWORDS }}
+          WEATHER_TIME: ${{ vars.WEATHER_TIME }}
+        run: python gh_bot.py
+
+      - name: Зберегти стан
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          if ! cmp -s state.json state.before; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in state.json -out state.enc -pass env:STATE_KEY
+            git config user.name "bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add state.enc
+            git commit -m "state"
+            git push
+          fi
