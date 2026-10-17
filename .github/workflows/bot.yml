@@ -56,5 +56,14 @@ jobs:
             git config user.email "bot@users.noreply.github.com"
             git add state.enc
             git commit -m "state"
-            git push
+            # якщо в репозиторії з'явились нові зміни, підтягуємо їх і пробуємо знову
+            for i in 1 2 3 4 5; do
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                exit 0
+              fi
+              git rebase --abort 2>/dev/null || true
+              sleep 5
+            done
+            echo "Не вдалося зберегти стан після 5 спроб"
+            exit 1
           fi
