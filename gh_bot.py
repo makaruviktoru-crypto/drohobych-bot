@@ -437,9 +437,30 @@ def run_news(st: dict) -> None:
     print(f"новин опубліковано: {posted}")
 
 
+def preflight() -> None:
+    """Швидка перевірка налаштувань. Недійсний токен робить запуск червоним."""
+    me = api("getMe")
+    if not me.get("ok"):
+        sys.exit(
+            f"❌ BOT_TOKEN недійсний або вставлений неправильно ({me.get('description')}). "
+            "Візьміть токен у @BotFather (API Token) і оновіть секрет BOT_TOKEN."
+        )
+    print(f"бот: @{me['result']['username']}")
+    print("ADMIN_ID задано:", "так" if ADMIN_ID else "НІ (секрет ADMIN_ID порожній)")
+    cm = api("getChatMember", chat_id=CHANNEL, user_id=me["result"]["id"])
+    if cm.get("ok"):
+        r = cm["result"]
+        ok = r.get("status") in ("administrator", "creator") and r.get("can_post_messages", True)
+        print("бот адміністратор каналу з правом публікації:",
+              "так" if ok else "НІ (додайте цього бота в адміністратори каналу)")
+    else:
+        print("канал недоступний боту:", cm.get("description"))
+
+
 def main() -> None:
     if not TOKEN:
-        sys.exit("BOT_TOKEN не задано")
+        sys.exit("❌ Секрет BOT_TOKEN порожній: додайте його в Settings → Secrets.")
+    preflight()
     st = load_state()
     try:
         for stage in (run_updates, run_scheduled, run_weather, run_news):
@@ -454,4 +475,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
