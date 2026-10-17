@@ -110,10 +110,14 @@ def btn(text: str, data: str) -> dict:
     return {"text": text, "callback_data": data}
 
 
-def rubric_kb(chat_id, msg_id) -> dict:
-    rows = [[btn(label, f"pub:{key}:{chat_id}:{msg_id}")] for key, (label, _) in RUBRICS.items()]
-    rows.append([btn("📤 Без рубрики", f"pub:none:{chat_id}:{msg_id}"),
+def rubric_kb(chat_id, msg_id, mode: str = "now") -> dict:
+    """mode=now: кнопка рубрики публікує одразу; mode=sched: веде до вибору часу."""
+    prefix = "pub" if mode == "now" else "sp"
+    rows = [[btn(label, f"{prefix}:{key}:{chat_id}:{msg_id}")] for key, (label, _) in RUBRICS.items()]
+    rows.append([btn("📤 Без рубрики", f"{prefix}:none:{chat_id}:{msg_id}"),
                  btn("❌ Відхилити", f"rej:x:{chat_id}:{msg_id}")])
+    if mode == "now":
+        rows.append([btn("🕒 Запланувати на потім", f"sch:x:{chat_id}:{msg_id}")])
     return {"inline_keyboard": rows}
 
 
@@ -122,7 +126,6 @@ def when_kb(rubric: str, chat_id, msg_id) -> dict:
         return btn(text, f"t:{w}:{rubric}:{chat_id}:{msg_id}")
 
     return {"inline_keyboard": [
-        [b("🚀 Зараз", "now")],
         [b("🕕 Сьогодні 18:00", "today18")],
         [b("🌅 Завтра 09:00", "tom09"), b("🌇 Завтра 18:00", "tom18")],
         [b("✏️ Вказати свій час", "custom")],
@@ -267,7 +270,7 @@ def handle_message(st: dict, m: dict) -> None:
                     send(chat["id"], f"🕒 Заплановано на {fmt_when(when)}.")
                 return
         remember(st, m)
-        send(chat["id"], "Оберіть рубрику для публікації:",
+        send(chat["id"], "Оберіть рубрику: пост опублікується одразу. Або заплануйте.",
              reply_markup=rubric_kb(chat["id"], m["message_id"]))
         return
 
@@ -301,7 +304,28 @@ def handle_callback(st: dict, cq: dict) -> None:
     if parts[0] == "rej":
         st["pending"].pop(f"{parts[2]}:{parts[3]}", None)
         edit("❌ Відхилено.")
-    elif parts[0] == "pub":
+    elif parts[0] == "pub":  # одразу публікуємо в обрану рубрику
+        _, rubric, chat_id, msg_id = parts
+        key = f"{chat_id}:{msg_id}"
+        p = st["pending"].get(key)
+        if p is None:
+            edit(lost)
+        else:
+            tag = tag_for(rubric)
+            res = publish_item(make_item(p, tag))
+            if res.get("ok"):
+                st["pending"].pop(key, None)
+                edit(f"✅ Опубліковано {tag}".strip())
+            else:
+                edit(f"⚠️ Не вдалося опублікувати: {html.escape(res.get('description', ''))}")
+    elif parts[0] == "sch":  # планування: спершу рубрика
+        _, _, chat_id, msg_id = parts
+        if f"{chat_id}:{msg_id}" not in st["pending"]:
+            edit(lost)
+        else:
+            edit("Оберіть рубрику для запланованого поста:",
+                 rubric_kb(chat_id, msg_id, "sched"))
+    elif parts[0] == "sp":  # потім час
         _, rubric, chat_id, msg_id = parts
         if f"{chat_id}:{msg_id}" not in st["pending"]:
             edit(lost)
@@ -472,6 +496,9 @@ def main() -> None:
     finally:
         save_state(st)
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
