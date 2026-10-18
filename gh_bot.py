@@ -39,24 +39,38 @@ def split(value: str) -> list:
 TOKEN = env("BOT_TOKEN")
 ADMIN_ID = int(env("ADMIN_ID", "0"))
 CHANNEL = env("CHANNEL_ID", "@drohobych_drohobychany")
-FEEDS = split(env("NEWS_FEEDS", "https://drohobych-rada.gov.ua/feed/"))
+FEEDS = split(env(
+    "NEWS_FEEDS",
+    "https://drohobych-rada.gov.ua/feed/,"
+    "https://drogmedia.net.ua/feed/,"
+    "https://droginfo.com.ua/feed/",
+))
 FEEDS_FILTERED = split(env(
     "NEWS_FEEDS_FILTERED",
     "https://zaxid.net/rss/,"
     "https://news.google.com/rss/search?q=Дрогобич&hl=uk&gl=UA&ceid=UA:uk",
 ))
+FEEDS_NATIONAL = split(env("NEWS_FEEDS_NATIONAL", "https://www.pravda.com.ua/rss/view_mainnews/"))
 KEYWORDS = [k.lower() for k in split(env("NEWS_KEYWORDS", "дрогобич,дрогобиц"))]
-WEATHER_TIME = env("WEATHER_TIME", "07:30")
+WEATHER_TIME = env("WEATHER_TIME", "09:00")
+SILENCE_TIME = env("SILENCE_TIME", "09:00")
 FACT_TIME = env("FACT_TIME", "12:00")
 DIGEST_TIME = env("DIGEST_TIME", "19:00")  # неділя
 FACTS_FILE = Path(env("FACTS_FILE", "facts.txt"))
 BOT_USERNAME = ""
 STATE_FILE = Path(env("STATE_FILE", "state.json"))
 NEWS_MAX_PER_RUN = 5
-NEWS_MAX_PER_DAY = 8
+NEWS_MAX_PER_DAY = 15
 NEWS_MAX_AGE_H = 48
 TZ = ZoneInfo("Europe/Kyiv")
-LAT, LON = 49.3544, 23.5075  # Дрогобич
+# Дрогобицький район: (назва, широта, довгота)
+PLACES = [
+    ("Дрогобич", 49.3544, 23.5075),
+    ("Борислав", 49.2893, 23.4276),
+    ("Трускавець", 49.2780, 23.5069),
+    ("Стебник", 49.2964, 23.5622),
+    ("Східниця", 49.2000, 23.4500),
+]
 
 RUBRICS = {
     "news": ("📰 Новини", "#Новини"),
@@ -111,8 +125,9 @@ def channel_kb():
                                   "url": f"https://t.me/{BOT_USERNAME}"}]]}
 
 
-def post(text: str) -> dict:
-    return send(CHANNEL, text, reply_markup=channel_kb())
+def post(text: str, silent: bool = False) -> dict:
+    return send(CHANNEL, text, reply_markup=channel_kb(),
+                disable_notification="true" if silent else None)
 
 
 # ---------- стан ----------
@@ -120,7 +135,8 @@ def load_state() -> dict:
     st = {"offset": 0, "seen": None, "scheduled": [], "pending": {},
           "waiting": None, "weather_date": "", "week_news": [],
           "digest_date": "", "fact_date": "", "fact_idx": 0,
-          "news_day": "", "news_n": 0, "backfilled": False}
+          "news_day": "", "news_n": 0, "backfilled": False,
+          "nat_hour": "", "nat_seen": [], "nat_init": False, "silence_date": ""}
     if STATE_FILE.exists():
         st.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     return st
@@ -441,14 +457,23 @@ def run_scheduled(st: dict) -> None:
 
 def weather_text() -> str:
     q = urllib.parse.urlencode({
-        "latitude": LAT, "longitude": LON, "timezone": "Europe/Kyiv", "forecast_days": 1,
+        "latitude": ",".join(str(p[1]) for p in PLACES),
+        "longitude": ",".join(str(p[2]) for p in PLACES),
+        "timezone": "Europe/Kyiv", "forecast_days": 1,
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode"})
     with urllib.request.urlopen(f"https://api.open-meteo.com/v1/forecast?{q}", timeout=20) as r:
-        d = json.load(r)["daily"]
-    desc = WEATHER_CODES.get(d["weathercode"][0], "🌡 без опису")
-    return (f"<b>Погода в Дрогобичі, {datetime.now(TZ):%d.%m.%Y}</b>\n\n{desc}\n"
-            f"🌡 вдень {d['temperature_2m_max'][0]:+.0f}°, вночі {d['temperature_2m_min'][0]:+.0f}°\n"
-            f"💧 опади: {d['precipitation_sum'][0]:.1f} мм\n\n#Афіша_і_корисне")
+        data = json.load(r)
+    if isinstance(data, dict):
+        data = [data]
+    lines = []
+    for (name, _, _), loc in zip(PLACES, data):
+        d = loc["daily"]
+        desc = WEATHER_CODES.get(d["weathercode"][0], "🌡 без опису")
+        lines.append(f"📍 <b>{name}</b>: {desc}\n"
+                     f"    вдень {d['temperature_2m_max'][0]:+.0f}°, вночі {d['temperature_2m_min'][0]:+.0f}°, "
+                     f"💧 {d['precipitation_sum'][0]:.1f} мм")
+    return (f"<b>Погода на Дрогобиччині, {datetime.now(TZ):%d.%m.%Y}</b>\n\n"
+            + "\n\n".join(lines) + "\n\n#Афіша_і_корисне #Погода")
 
 
 def run_weather(st: dict) -> None:
@@ -484,9 +509,12 @@ def run_news(st: dict) -> None:
     seen_list = list(st["seen"] or [])
     seen = set(seen_list)
     pending = []
-    for url, filtered in [(u, False) for u in FEEDS] + [(u, True) for u in FEEDS_FILTERED]:
+    sources = [(u, False, False) for u in FEEDS] + [(u, True, False) for u in FEEDS_FILTERED]
+    for url, filtered, national in sources:
         feed = feedparser.parse(url)
         source = feed.feed.get("title", "")
+        print(f"стрічка {url.split('/')[2]}: записів {len(feed.entries)}"
+              + ("" if feed.entries else f" (проблема: {getattr(feed, 'bozo_exception', None) or getattr(feed, 'status', '?')})"))
         for entry in reversed(feed.entries):  # від старіших до новіших
             uid = entry.get("id") or entry.get("link")
             if not uid or uid in seen:
@@ -501,7 +529,7 @@ def run_news(st: dict) -> None:
     if st["news_day"] != today:
         st["news_day"], st["news_n"] = today, 0
 
-    def publish(entry, source) -> bool:
+    def publish(entry, source, national=False) -> bool:
         title = html.escape(entry.get("title", "Без назви"))
         summary = clean_summary(entry)
         if summary.lower().startswith(entry.get("title", "").lower()[:40]):
@@ -510,7 +538,8 @@ def run_news(st: dict) -> None:
         link = entry.get("link", "")
         src = html.escape(entry.get("source", {}).get("title") or source or "джерело")
         res = post(f"📰 <b>{title}</b>{body}\n\n"
-                   f'🔗 <a href="{html.escape(link, quote=True)}">Читати: {src}</a>\n\n#Новини')
+                   f'🔗 <a href="{html.escape(link, quote=True)}">Читати: {src}</a>\n\n'
+                   + ("#Новини #Україна" if national else "#Новини"))
         if not res.get("ok"):
             print("новину не опубліковано:", res.get("description"))
             return False
@@ -540,7 +569,7 @@ def run_news(st: dict) -> None:
                 seen_list.append(uid)
                 continue
             if st["news_n"] >= NEWS_MAX_PER_DAY:
-                break
+                break  # ліміт на день вичерпано, решта підуть завтра
             if not publish(entry, source):
                 break
             seen_list.append(uid)
@@ -595,11 +624,79 @@ def run_digest(st: dict) -> None:
     week = [n for n in st["week_news"] if time.time() - n["ts"] < 7 * 86400 and n["link"]]
     if not week:
         return
-    top = week[-5:][::-1]  # п'ять найсвіжіших
+    local = [n for n in week if not n.get("nat")][-3:]  # місцевим віддаємо перевагу
+    rest = [n for n in week if n.get("nat")][-(5 - len(local)):] if len(local) < 5 else []
+    top = (local + rest)[-5:][::-1]
     lines = [f'{i}. <a href="{html.escape(n["link"], quote=True)}">{html.escape(n["title"])}</a>'
              for i, n in enumerate(top, 1)]
     post("🗞 <b>Головне за тиждень</b>\n\n" + "\n\n".join(lines) + "\n\n#Новини #Дайджест")
     print("дайджест опубліковано")
+
+
+def silence_text() -> str:
+    return ("🕯 <b>9:00. Хвилина мовчання</b>\n\n"
+            "Щодня о 9:00 зупиняємося, щоб вшанувати пам'ять усіх, хто загинув, "
+            "захищаючи Україну, і мирних людей, життя яких обірвала війна.\n\n"
+            "Вічна пам'ять Героям. 🇺🇦\n\n#Хвилина_мовчання")
+
+
+def run_silence(st: dict) -> None:
+    now = datetime.now(TZ)
+    today = now.strftime("%Y-%m-%d")
+    h, m = map(int, SILENCE_TIME.split(":"))
+    at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    # нагадування має сенс лише поруч із 9:00: від -5 до +30 хвилин
+    if st["silence_date"] != today and at - timedelta(minutes=5) <= now < at + timedelta(minutes=30):
+        if post(silence_text()).get("ok"):
+            st["silence_date"] = today
+            print("хвилину мовчання опубліковано")
+            time.sleep(2)
+
+
+def run_national(st: dict) -> None:
+    """Раз на годину: головна новина України з «Української правди»."""
+    now = datetime.now(TZ)
+    hour_key = now.strftime("%Y-%m-%d %H")
+    if st["nat_hour"] == hour_key:
+        return
+    entries = []
+    for url in FEEDS_NATIONAL:
+        feed = feedparser.parse(url)
+        print(f"стрічка {url.split('/')[2]}: записів {len(feed.entries)}")
+        for e in feed.entries:
+            uid = e.get("id") or e.get("link")
+            if uid:
+                entries.append((uid, feed.feed.get("title", ""), e))
+    if not entries:
+        return
+    entries.sort(key=lambda x: x[2].get("published_parsed") or time.gmtime(0), reverse=True)
+    if not st["nat_init"]:  # перший запуск: лише запам'ятовуємо
+        st["nat_init"] = True
+        st["nat_seen"] = [x[0] for x in entries][-500:]
+        return
+    seen = set(st["nat_seen"])
+    fresh = [x for x in entries if x[0] not in seen]
+    if not fresh:
+        return
+    uid, source, e = fresh[0]
+    title = html.escape(e.get("title", "Без назви"))
+    summary = clean_summary(e)
+    if summary.lower().startswith(e.get("title", "").lower()[:40]):
+        summary = ""
+    body = f"\n\n{html.escape(summary)}" if summary else ""
+    link = html.escape(e.get("link", ""), quote=True)
+    silent = now.hour >= 23 or now.hour < 7  # вночі без звуку
+    res = post(f"🇺🇦 <b>{title}</b>{body}\n\n"
+               f'🔗 <a href="{link}">Читати: {html.escape(source or "Українська правда")}</a>'
+               f"\n\n#Новини #Україна", silent=silent)
+    if res.get("ok"):
+        st["nat_hour"] = hour_key
+        st["nat_seen"] = (st["nat_seen"] + [x[0] for x in fresh])[-500:]
+        st["week_news"].append({"title": e.get("title", ""), "link": e.get("link", ""),
+                                "ts": time.time(), "nat": True})
+        print("новину України опубліковано")
+    else:
+        print("новину України не опубліковано:", res.get("description"))
 
 
 def preflight() -> None:
@@ -630,7 +727,8 @@ def main() -> None:
     preflight()
     st = load_state()
     try:
-        for stage in (run_updates, run_scheduled, run_weather, run_fact, run_news, run_digest):
+        for stage in (run_updates, run_scheduled, run_silence, run_weather, run_fact,
+                      run_news, run_national, run_digest):
             try:
                 stage(st)
             except Exception:
