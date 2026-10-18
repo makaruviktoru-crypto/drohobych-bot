@@ -9,8 +9,10 @@
 Стан (черга, список побачених новин) лежить у state.json, який workflow
 шифрує й зберігає в репозиторії. У логах НЕ друкуємо жодних особистих даних.
 """
+import calendar
 import html
 import json
+import re
 import os
 import sys
 import time
@@ -38,11 +40,21 @@ TOKEN = env("BOT_TOKEN")
 ADMIN_ID = int(env("ADMIN_ID", "0"))
 CHANNEL = env("CHANNEL_ID", "@drohobych_drohobychany")
 FEEDS = split(env("NEWS_FEEDS", "https://drohobych-rada.gov.ua/feed/"))
-FEEDS_FILTERED = split(env("NEWS_FEEDS_FILTERED", "https://zaxid.net/rss/"))
+FEEDS_FILTERED = split(env(
+    "NEWS_FEEDS_FILTERED",
+    "https://zaxid.net/rss/,"
+    "https://news.google.com/rss/search?q=Дрогобич&hl=uk&gl=UA&ceid=UA:uk",
+))
 KEYWORDS = [k.lower() for k in split(env("NEWS_KEYWORDS", "дрогобич,дрогобиц"))]
 WEATHER_TIME = env("WEATHER_TIME", "07:30")
+FACT_TIME = env("FACT_TIME", "12:00")
+DIGEST_TIME = env("DIGEST_TIME", "19:00")  # неділя
+FACTS_FILE = Path(env("FACTS_FILE", "facts.txt"))
+BOT_USERNAME = ""
 STATE_FILE = Path(env("STATE_FILE", "state.json"))
 NEWS_MAX_PER_RUN = 5
+NEWS_MAX_PER_DAY = 8
+NEWS_MAX_AGE_H = 48
 TZ = ZoneInfo("Europe/Kyiv")
 LAT, LON = 49.3544, 23.5075  # Дрогобич
 
@@ -51,6 +63,7 @@ RUBRICS = {
     "history": ("🏛 Історія", "#Історія"),
     "people": ("👥 Дрогобичани", "#Дрогобичани"),
     "afisha": ("🎭 Афіша і корисне", "#Афіша_і_корисне"),
+    "week": ("🌟 Дрогобичанин тижня", "#Дрогобичани #Дрогобичанин_тижня"),
 }
 
 WEATHER_CODES = {
@@ -90,10 +103,24 @@ def send(chat_id, text: str, **kw) -> dict:
     return api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", **kw)
 
 
+def channel_kb():
+    """Кнопка під кожним постом каналу: запрошення надсилати новини боту."""
+    if not BOT_USERNAME:
+        return None
+    return {"inline_keyboard": [[{"text": "✍️ Є новина? Напишіть боту",
+                                  "url": f"https://t.me/{BOT_USERNAME}"}]]}
+
+
+def post(text: str) -> dict:
+    return send(CHANNEL, text, reply_markup=channel_kb())
+
+
 # ---------- стан ----------
 def load_state() -> dict:
     st = {"offset": 0, "seen": None, "scheduled": [], "pending": {},
-          "waiting": None, "weather_date": ""}
+          "waiting": None, "weather_date": "", "week_news": [],
+          "digest_date": "", "fact_date": "", "fact_idx": 0,
+          "news_day": "", "news_n": 0, "backfilled": False}
     if STATE_FILE.exists():
         st.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     return st
@@ -166,10 +193,10 @@ def publish_item(item: dict) -> dict:
     # сутності (жирний, посилання) лишаються валідними, бо тег додаємо в кінець
     if item["is_text"]:
         return api("sendMessage", chat_id=CHANNEL, text=text,
-                   entities=item["entities"] or None)
+                   entities=item["entities"] or None, reply_markup=channel_kb())
     return api("copyMessage", chat_id=CHANNEL, from_chat_id=item["chat_id"],
                message_id=item["msg_id"], caption=text,
-               caption_entities=item["entities"] or None)
+               caption_entities=item["entities"] or None, reply_markup=channel_kb())
 
 
 def preset_when(w: str) -> datetime:
@@ -211,6 +238,8 @@ def handle_message(st: dict, m: dict) -> None:
                      "• Надішліть мені пост (текст, фото, відео): оберіть рубрику й час\n"
                      "• /announce <i>текст</i>: оголошення одразу\n"
                      "• /weather: погода зараз\n"
+                     "• /poll <i>Питання | варіант 1 | варіант 2</i>: опитування в канал\n"
+                     "• /fact: факт про Дрогобич зараз\n"
                      "• /queue: заплановане, /cancel <i>id</i>: скасувати\n\n"
                      "Бот відповідає з затримкою до ~10 хв.")
             else:
@@ -220,13 +249,27 @@ def handle_message(st: dict, m: dict) -> None:
                      "перевірки модератором воно з'явиться в каналі. Відповідь може "
                      "прийти не одразу.")
         elif is_admin and cmd == "/weather":
-            send(CHANNEL, weather_text())
+            post(weather_text())
             send(chat["id"], "✅ Погоду опубліковано.")
+        elif is_admin and cmd == "/poll":
+            parts = [x.strip() for x in args.split("|") if x.strip()]
+            if len(parts) < 3 or len(parts) > 11:
+                send(chat["id"], "Використання: /poll Питання | варіант 1 | варіант 2 "
+                                 "(від 2 до 10 варіантів)")
+            else:
+                res = api("sendPoll", chat_id=CHANNEL, question=parts[0][:300],
+                          options=[o[:100] for o in parts[1:]], is_anonymous="true",
+                          reply_markup=channel_kb())
+                send(chat["id"], "✅ Опитування опубліковано." if res.get("ok")
+                     else f"⚠️ Не вдалося: {html.escape(res.get('description', ''))}")
+        elif is_admin and cmd == "/fact":
+            send(chat["id"], "✅ Факт опубліковано." if post_fact(st)
+                 else "Файл facts.txt порожній або публікація не вдалась.")
         elif is_admin and cmd == "/announce":
             if not args:
                 send(chat["id"], "Використання: /announce текст")
             else:
-                send(CHANNEL, f"📢 <b>Оголошення</b>\n\n{html.escape(args)}\n\n#Афіша_і_корисне")
+                post(f"📢 <b>Оголошення</b>\n\n{html.escape(args)}\n\n#Афіша_і_корисне")
                 send(chat["id"], "✅ Оголошення опубліковано.")
         elif is_admin and cmd == "/queue":
             items = sorted(st["scheduled"], key=lambda i: i["when"])
@@ -415,7 +458,7 @@ def run_weather(st: dict) -> None:
     today = now.strftime("%Y-%m-%d")
     # публікуємо в межах 3 годин після призначеного часу, щоб не слати пізню погоду
     if st["weather_date"] != today and at <= now < at + timedelta(hours=3):
-        if send(CHANNEL, weather_text()).get("ok"):
+        if post(weather_text()).get("ok"):
             st["weather_date"] = today
             print("погоду опубліковано")
 
@@ -423,6 +466,17 @@ def run_weather(st: dict) -> None:
 def matches(entry) -> bool:
     text = f"{entry.get('title', '')} {entry.get('summary', '')}".lower()
     return any(k in text for k in KEYWORDS)
+
+
+def clean_summary(entry, limit: int = 280) -> str:
+    raw = entry.get("summary", "") or ""
+    text = html.unescape(re.sub(r"<[^>]+>", " ", raw))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s*(Читати далі|Read more|The post).*$", "", text, flags=re.I).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return cut + "…"
 
 
 def run_news(st: dict) -> None:
@@ -443,22 +497,109 @@ def run_news(st: dict) -> None:
                 continue
             pending.append((uid, source, entry))
     posted = 0
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    if st["news_day"] != today:
+        st["news_day"], st["news_n"] = today, 0
+
+    def publish(entry, source) -> bool:
+        title = html.escape(entry.get("title", "Без назви"))
+        summary = clean_summary(entry)
+        if summary.lower().startswith(entry.get("title", "").lower()[:40]):
+            summary = ""  # анотація лише повторює заголовок
+        body = f"\n\n{html.escape(summary)}" if summary else ""
+        link = entry.get("link", "")
+        src = html.escape(entry.get("source", {}).get("title") or source or "джерело")
+        res = post(f"📰 <b>{title}</b>{body}\n\n"
+                   f'🔗 <a href="{html.escape(link, quote=True)}">Читати: {src}</a>\n\n#Новини')
+        if not res.get("ok"):
+            print("новину не опубліковано:", res.get("description"))
+            return False
+        st["week_news"].append({"title": entry.get("title", ""), "link": link,
+                                "ts": time.time()})
+        time.sleep(2)
+        return True
+
+    def too_old(entry) -> bool:
+        t = entry.get("published_parsed") or entry.get("updated_parsed")
+        return bool(t) and time.time() - calendar.timegm(t) > NEWS_MAX_AGE_H * 3600
+
     if first_run:  # перший запуск: не засмічуємо канал старими новинами
         for uid, _, _ in pending:
             seen_list.append(uid)
     else:
+        if not st["backfilled"]:  # один раз: щоб канал не був порожнім
+            st["backfilled"] = True
+            for url in FEEDS[:1]:
+                feed = feedparser.parse(url)
+                for entry in list(feed.entries)[:3][::-1]:
+                    if publish(entry, feed.feed.get("title", "")):
+                        posted += 1
+                        st["news_n"] += 1
         for uid, source, entry in pending[:NEWS_MAX_PER_RUN]:
-            title = html.escape(entry.get("title", "Без назви"))
-            res = send(CHANNEL, f"📰 <b>{title}</b>\n\n{html.escape(source)}\n"
-                                f"{entry.get('link', '')}\n\n#Новини")
-            if not res.get("ok"):
-                print("новину не опубліковано:", res.get("description"))
+            if too_old(entry):
+                seen_list.append(uid)
+                continue
+            if st["news_n"] >= NEWS_MAX_PER_DAY:
+                break
+            if not publish(entry, source):
                 break
             seen_list.append(uid)
+            st["news_n"] += 1
             posted += 1
-            time.sleep(2)
     st["seen"] = seen_list[-3000:]
+    st["week_news"] = [n for n in st["week_news"] if time.time() - n["ts"] < 8 * 86400][-60:]
     print(f"новин опубліковано: {posted}")
+
+
+def load_facts() -> list:
+    if not FACTS_FILE.exists():
+        return []
+    return [ln.strip() for ln in FACTS_FILE.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")]
+
+
+def post_fact(st: dict) -> bool:
+    facts = load_facts()
+    if not facts:
+        return False
+    idx = st.get("fact_idx", 0) % len(facts)
+    res = post(f"🏛 <b>Дрогобич: факт дня</b>\n\n{html.escape(facts[idx])}\n\n#Історія #Факт_дня")
+    if res.get("ok"):
+        st["fact_idx"] = idx + 1
+        return True
+    print("факт не опубліковано:", res.get("description"))
+    return False
+
+
+def in_window(now: datetime, hhmm: str, hours: int = 3) -> bool:
+    h, m = map(int, hhmm.split(":"))
+    at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return at <= now < at + timedelta(hours=hours)
+
+
+def run_fact(st: dict) -> None:
+    now = datetime.now(TZ)
+    today = now.strftime("%Y-%m-%d")
+    if st["fact_date"] != today and in_window(now, FACT_TIME):
+        if post_fact(st):
+            st["fact_date"] = today
+            print("факт дня опубліковано")
+
+
+def run_digest(st: dict) -> None:
+    now = datetime.now(TZ)
+    today = now.strftime("%Y-%m-%d")
+    if now.weekday() != 6 or st["digest_date"] == today or not in_window(now, DIGEST_TIME):
+        return
+    st["digest_date"] = today
+    week = [n for n in st["week_news"] if time.time() - n["ts"] < 7 * 86400 and n["link"]]
+    if not week:
+        return
+    top = week[-5:][::-1]  # п'ять найсвіжіших
+    lines = [f'{i}. <a href="{html.escape(n["link"], quote=True)}">{html.escape(n["title"])}</a>'
+             for i, n in enumerate(top, 1)]
+    post("🗞 <b>Головне за тиждень</b>\n\n" + "\n\n".join(lines) + "\n\n#Новини #Дайджест")
+    print("дайджест опубліковано")
 
 
 def preflight() -> None:
@@ -469,7 +610,9 @@ def preflight() -> None:
             f"❌ BOT_TOKEN недійсний або вставлений неправильно ({me.get('description')}). "
             "Візьміть токен у @BotFather (API Token) і оновіть секрет BOT_TOKEN."
         )
-    print(f"бот: @{me['result']['username']}")
+    global BOT_USERNAME
+    BOT_USERNAME = me["result"]["username"]
+    print(f"бот: @{BOT_USERNAME}")
     print("ADMIN_ID задано:", "так" if ADMIN_ID else "НІ (секрет ADMIN_ID порожній)")
     cm = api("getChatMember", chat_id=CHANNEL, user_id=me["result"]["id"])
     if cm.get("ok"):
@@ -487,7 +630,7 @@ def main() -> None:
     preflight()
     st = load_state()
     try:
-        for stage in (run_updates, run_scheduled, run_weather, run_news):
+        for stage in (run_updates, run_scheduled, run_weather, run_fact, run_news, run_digest):
             try:
                 stage(st)
             except Exception:
@@ -496,9 +639,6 @@ def main() -> None:
     finally:
         save_state(st)
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
